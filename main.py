@@ -393,6 +393,291 @@ def remove_think_tags(text):
     return re.sub(r'<think>[\s\S]*?</think>', '', text)
 
 @app.route('/v1/chat/completions', methods=['POST'])
+def chat_completions():
+    try:
+        # 新增：验证API密钥
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({
+                "error": {
+                    "message": "缺少 Authorization 头部信息",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_api_key"
+                }
+            }), 401
+
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return jsonify({
+                "error": {
+                    "message": "Authorization 头部格式无效，格式应为: Bearer <API_KEY>",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_api_key"
+                }
+            }), 401
+
+        provided_api_key = parts[1]
+        if provided_api_key not in VALID_API_KEYS:
+            return jsonify({
+                "error": {
+                    "message": "API 密钥无效",
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "invalid_api_key"
+                }
+            }), 401
+
+        # 继续处理原始逻辑
+        openai_request = request.get_json()
+        logger.info(f"Received request: {json.dumps(openai_request, ensure_ascii=False)}")
+        
+        model = openai_request.get("model", "claude-3-5-sonnet-v2")
+        
+        # 验证模型是否支持
+        api_key = get_api_key(model)
+        if not api_key:
+            error_msg = f"模型 {model} 不被支持。可用模型: {', '.join(model_manager.name_to_api_key.keys())}"
+            logger.error(error_msg)
+            return jsonify({
+                "error": {
+                    "message": error_msg,
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": "model_not_found"
+                }
+            }), 404
+            
+        dify_request = transform_openai_to_dify(openai_request, "/chat/completions")
+        
+        if not dify_request:
+            logger.error("请求转换失败")
+            return jsonify({
+                "error": {
+                    "message": "请求格式无效",
+                    "type": "invalid_request_error",
+                    "param": None
+                }
+            }), 400
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        stream = openai_request.get("stream", False)
+        dify_endpoint = f"{DIFY_API_BASE}/chat-messages"
+        logger.info(f"Sending request to Dify endpoint: {dify_endpoint}, stream={stream}")
+
+        # 强制所有 Dify 请求都用 streaming，规避 Dify 超时
+        dify_request['response_mode'] = 'streaming'
+
+        if stream:
+            logger.info("[流式处理] 当前为流式输出模式，后端始终用 Dify streaming 接口")
+            def generate():
+                client = httpx.Client(timeout=600)
+                def flush_chunk(chunk_data):
+                    return chunk_data.encode('utf-8')
+                def calculate_delay(buffer_size):
+                    if buffer_size > 30:
+                        return 0.001
+                    elif buffer_size > 20:
+                        return 0.002
+                    elif buffer_size > 10:
+                        return 0.01
+                    else:
+                        return 0.02
+                def send_char(char, message_id):
+                    openai_chunk = {
+                        "id": message_id,
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": char},
+                            "finish_reason": None
+                        }]
+                    }
+                    chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
+                    return flush_chunk(chunk_data)
+                output_buffer = []
+                try:
+                    with client.stream(
+                        'POST',
+                        dify_endpoint,
+                        json=dify_request,
+                        headers={
+                            **headers,
+                            'Accept': 'text/event-stream',
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive'
+                        }
+                    ) as response:
+                        generate.message_id = None
+                        buffer = ""
+                        for raw_bytes in response.iter_raw():
+                            if not raw_bytes:
+                                continue
+                            try:
+                                buffer += raw_bytes.decode('utf-8')
+                                while '\n' in buffer:
+                                    line, buffer = buffer.split('\n', 1)
+                                    line = line.strip()
+                                    if not line or not line.startswith('data: '):
+                                        continue
+                                    try:
+                                        json_str = line[6:]
+                                        dify_chunk = json.loads(json_str)
+                                        if dify_chunk.get("event") == "message" and "answer" in dify_chunk:
+                                            current_answer = dify_chunk["answer"]
+                                            if not current_answer:
+                                                continue
+                                            message_id = dify_chunk.get("message_id", "")
+                                            if not generate.message_id:
+                                                generate.message_id = message_id
+                                            # 先拼到大 buffer，去除 <think> 块后再输出
+                                            filtered_answer = remove_think_tags(current_answer)
+                                            for char in filtered_answer:
+                                                output_buffer.append((char, generate.message_id))
+                                            while output_buffer:
+                                                char, msg_id = output_buffer.pop(0)
+                                                yield send_char(char, msg_id)
+                                                delay = calculate_delay(len(output_buffer))
+                                                time.sleep(delay)
+                                            continue
+                                        elif dify_chunk.get("event") == "agent_message" and "answer" in dify_chunk:
+                                            current_answer = dify_chunk["answer"]
+                                            if not current_answer:
+                                                continue
+                                            message_id = dify_chunk.get("message_id", "")
+                                            if not generate.message_id:
+                                                generate.message_id = message_id
+                                            filtered_answer = remove_think_tags(current_answer)
+                                            for char in filtered_answer:
+                                                output_buffer.append((char, generate.message_id))
+                                            while output_buffer:
+                                                char, msg_id = output_buffer.pop(0)
+                                                yield send_char(char, msg_id)
+                                                delay = calculate_delay(len(output_buffer))
+                                                time.sleep(delay)
+                                            continue
+                                        elif dify_chunk.get("event") == "message_end":
+                                            while output_buffer:
+                                                char, msg_id = output_buffer.pop(0)
+                                                yield send_char(char, msg_id)
+                                                time.sleep(0.001)
+                                            final_chunk = {
+                                                "id": generate.message_id,
+                                                "object": "chat.completion.chunk",
+                                                "created": int(time.time()),
+                                                "model": model,
+                                                "choices": [{
+                                                    "index": 0,
+                                                    "delta": {},
+                                                    "finish_reason": "stop"
+                                                }]
+                                            }
+                                            yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
+                                            yield flush_chunk("data: [DONE]\n\n")
+                                    except json.JSONDecodeError as e:
+                                        logger.error(f"JSON decode error: {str(e)}")
+                                        continue
+                            except Exception as e:
+                                logger.error(f"Error processing chunk: {str(e)}")
+                                continue
+                finally:
+                    client.close()
+            return Response(
+                stream_with_context(generate()),
+                content_type='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache, no-transform',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no',
+                    'Content-Encoding': 'none'
+                },
+                direct_passthrough=True
+            )
+        else:
+            def collect_stream():
+                client = httpx.Client(timeout=600)
+                content = ""
+                message_id = None
+                try:
+                    with client.stream(
+                        'POST',
+                        dify_endpoint,
+                        json=dify_request,
+                        headers={
+                            **headers,
+                            'Accept': 'text/event-stream',
+                            'Cache-Control': 'no-cache',
+                            'Connection': 'keep-alive'
+                        }
+                    ) as response:
+                        buffer = ""
+                        for raw_bytes in response.iter_raw():
+                            if not raw_bytes:
+                                continue
+                            buffer += raw_bytes.decode('utf-8')
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                line = line.strip()
+                                if not line or not line.startswith('data: '):
+                                    continue
+                                try:
+                                    json_str = line[6:]
+                                    dify_chunk = json.loads(json_str)
+                                    if dify_chunk.get("event") == "message" and "answer" in dify_chunk:
+                                        current_answer = dify_chunk["answer"]
+                                        if not current_answer:
+                                            continue
+                                        if not message_id:
+                                            message_id = dify_chunk.get("message_id", "")
+                                        content += current_answer
+                                    elif dify_chunk.get("event") == "agent_message" and "answer" in dify_chunk:
+                                        current_answer = dify_chunk["answer"]
+                                        if not current_answer:
+                                            continue
+                                        if not message_id:
+                                            message_id = dify_chunk.get("message_id", "")
+                                        content += current_answer
+                                    elif dify_chunk.get("event") == "message_end":
+                                        break
+                                except Exception:
+                                    continue
+                finally:
+                    client.close()
+                # 最终统一去除 <think> 块
+                content = remove_think_tags(content)
+                openai_response = {
+                    "id": message_id or "",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": content
+                        },
+                        "finish_reason": "stop"
+                    }]
+                }
+                return openai_response
+            return jsonify(collect_stream())
+
+    except Exception as e:
+        logger.exception("发生未知错误")
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "internal_error",
+                "param": None
+            }
+        }), 500
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
@@ -424,4 +709,3 @@ if __name__ == '__main__':
     port = int(os.getenv("SERVER_PORT", 5000))
     logger.info(f"Starting server on http://{host}:{port}")
     app.run(debug=True, host=host, port=port)
-
