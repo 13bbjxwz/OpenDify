@@ -393,6 +393,220 @@ def remove_think_tags(text):
     return re.sub(r'<think>[\s\S]*?</think>', '', text)
 
 @app.route('/v1/chat/completions', methods=['POST'])
+def chat_completions():
+    try:
+        # 1. API 密钥验证
+        auth_header = request.headers.get('Authorization')
+        if not auth_header:
+            return jsonify({"error": "缺少 Authorization 头部信息"}), 401
+
+        parts = auth_header.split()
+        if len(parts) != 2 or parts[0].lower() != 'bearer':
+            return jsonify({"error": "Authorization 头部格式无效"}), 401
+
+        provided_api_key = parts[1]
+        if provided_api_key not in VALID_API_KEYS:
+            return jsonify({"error": "API 密钥无效"}), 401
+
+        # 2. 请求解析和模型验证
+        openai_request = request.get_json()
+        logger.info(f"收到请求: {json.dumps(openai_request, ensure_ascii=False)}")
+
+        model = openai_request.get("model", "claude-3-5-sonnet-v2")
+        api_key = get_api_key(model)
+        if not api_key:
+            error_msg = f"模型 {model} 不被支持"
+            logger.error(error_msg)
+            return jsonify({"error": error_msg}), 404
+
+        # 3. 请求转换
+        dify_request = transform_openai_to_dify(openai_request, "/chat/completions")
+        if not dify_request:
+            logger.error("请求转换失败")
+            return jsonify({"error": "请求格式无效"}), 400
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # 4. 流式处理分支判断
+        stream = openai_request.get("stream", False)
+        dify_endpoint = f"{DIFY_API_BASE}/chat-messages"
+
+        # 强制所有Dify请求都使用streaming模式
+        dify_request['response_mode'] = 'streaming'
+
+        if stream:
+            # 流式处理逻辑
+            def generate():
+                client = httpx.Client(timeout=600)
+                output_buffer = []
+                message_id_holder = {"id": None}  # 使用可变对象来持有message_id
+
+                def flush_chunk(chunk_data):
+                    return chunk_data.encode('utf-8')
+
+                def calculate_delay(buffer_size):
+                    if buffer_size > 30: return 0.001
+                    if buffer_size > 20: return 0.002
+                    if buffer_size > 10: return 0.01
+                    return 0.02
+
+                def send_char(char, message_id):
+                    openai_chunk = create_openai_stream_response(char, message_id, model)
+                    chunk_data = f"data: {json.dumps(openai_chunk)}\n\n"
+                    return flush_chunk(chunk_data)
+
+                try:
+                    with client.stream('POST', dify_endpoint, json=dify_request, headers=headers) as response:
+                        buffer = ""
+                        for raw_bytes in response.iter_raw():
+                            if not raw_bytes:
+                                continue
+
+                            buffer += raw_bytes.decode('utf-8')
+
+                            while '\n' in buffer:
+                                line, buffer = buffer.split('\n', 1)
+                                line = line.strip()
+
+                                if not line or not line.startswith('data: '):
+                                    continue
+
+                                try:
+                                    json_str = line[6:]
+                                    dify_chunk = json.loads(json_str)
+
+                                    event = dify_chunk.get("event")
+                                    answer = dify_chunk.get("answer", "")
+
+                                    if event in ("message", "agent_message") and answer:
+                                        if not message_id_holder["id"]:
+                                            message_id_holder["id"] = dify_chunk.get("message_id", f"chatcmpl-{''.join(str(time.time()).split('.'))}")
+
+                                        filtered_answer = remove_think_tags(answer)
+                                        for char_item in filtered_answer:
+                                            output_buffer.append((char_item, message_id_holder["id"]))
+
+                                        while output_buffer:
+                                            char_to_send, msg_id = output_buffer.pop(0)
+                                            yield send_char(char_to_send, msg_id)
+                                            delay = calculate_delay(len(output_buffer))
+                                            time.sleep(delay)
+
+                                    elif event == "message_end":
+                                        while output_buffer:
+                                            char_to_send, msg_id = output_buffer.pop(0)
+                                            yield send_char(char_to_send, msg_id)
+                                            time.sleep(0.001)
+
+                                        final_chunk = {
+                                            "id": message_id_holder["id"],
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": model,
+                                            "choices": [{
+                                                "index": 0,
+                                                "delta": {},
+                                                "finish_reason": "stop"
+                                            }]
+                                        }
+                                        yield flush_chunk(f"data: {json.dumps(final_chunk)}\n\n")
+                                        yield flush_chunk("data: [DONE]\n\n")
+                                        # 确保在发送DONE后生成器停止
+                                        return
+
+                                except json.JSONDecodeError:
+                                    logger.warning(f"JSON解析错误: {line}")
+                                    continue
+
+                        # 处理流结束但没有 message_end 事件的情况
+                        while output_buffer:
+                            char_to_send, msg_id = output_buffer.pop(0)
+                            yield send_char(char_to_send, msg_id)
+                            time.sleep(0.001)
+
+                except Exception as e:
+                    logger.error(f"处理数据块时发生错误: {str(e)}")
+                finally:
+                    client.close()
+
+            return Response(stream_with_context(generate()), content_type='text/event-stream')
+
+        else:
+            # 非流式处理逻辑
+            client = httpx.Client(timeout=600)
+            content = ""
+            message_id = None
+
+            try:
+                with client.stream('POST', dify_endpoint, json=dify_request, headers=headers) as response:
+                    buffer = ""
+                    for raw_bytes in response.iter_raw():
+                        if not raw_bytes:
+                            continue
+
+                        buffer += raw_bytes.decode('utf-8')
+
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line = line.strip()
+
+                            if not line or not line.startswith('data: '):
+                                continue
+
+                            try:
+                                json_str = line[6:]
+                                dify_chunk = json.loads(json_str)
+
+                                event = dify_chunk.get("event")
+                                answer = dify_chunk.get("answer", "")
+
+                                if event in ("message", "agent_message") and answer:
+                                    if not message_id:
+                                        message_id = dify_chunk.get("message_id", f"chatcmpl-{''.join(str(time.time()).split('.'))}")
+                                    content += answer
+
+                                elif event == "message_end":
+                                    break
+
+                            except json.JSONDecodeError:
+                                logger.warning(f"JSON解析错误: {line}")
+                                continue
+
+            finally:
+                client.close()
+
+            final_content = remove_think_tags(content)
+
+            openai_response = {
+                "id": message_id or f"chatcmpl-{''.join(str(time.time()).split('.'))}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": final_content
+                    },
+                    "finish_reason": "stop"
+                }]
+            }
+            return jsonify(openai_response)
+
+    except Exception as e:
+        logger.error(f"发生未知错误: {str(e)}", exc_info=True)
+        return jsonify({
+            "error": {
+                "message": str(e),
+                "type": "internal_server_error",
+                "param": None,
+                "code": None
+            }
+        }), 500
+
 
 @app.route('/v1/models', methods=['GET'])
 def list_models():
